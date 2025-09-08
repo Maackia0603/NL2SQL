@@ -4,7 +4,11 @@ from mcp.server import FastMCP
 # from sql_graph.my_llm import zhipuai_client
 # from sql_graph.my_state import SQLState
 
-mcp_server = FastMCP(name='lx-mcp', instructions='我自己的MCP服务', port=8000)
+mcp_server = FastMCP(
+    name='data-mcp', 
+    instructions='MCP server for database', 
+    port=8000
+)
 
 # db = SQLDatabase.from_uri('postgresql+psycopg2://readonly_user:Z+Idv6Nc^9%5k8]W0F;ghCa7M=41jxYA@localhost:15432/postgres')
 # db = SQLDatabase.from_uri('postgresql+psycopg2://postgres:aisProjectData2025#!@localhost:15432/postgres')
@@ -13,7 +17,7 @@ db = SQLDatabase.from_uri(
     'postgresql+psycopg2://readonly_user:Z+Idv6Nc^9%5k8]W0F;ghCa7M=41jxYA@localhost:15432/postgres',
     engine_args={
         "pool_pre_ping": True,          # 每次借用连接前发心跳，自动剔除坏连接
-        "pool_recycle": 1800,           # 连接存活时间（秒），定期回收
+        "pool_recycle": 30000,           # 连接存活时间（秒），定期回收
         "pool_size": 5,                 # 连接池大小
         "max_overflow": 10,             # 允许的溢出连接
         "connect_args": {               # 客户端 TCP keepalive
@@ -57,7 +61,19 @@ def db_query_tool(query: str) -> str:
     Returns:
         str: 查询结果或错误信息
     """
-    result = db.run_no_throw(query)  # 执行查询（不抛出异常）
-    if not result:
-        return "错误: 查询失败。请修改查询语句后重试。"
-    return result
+    try:
+        result = db.run_no_throw(query)
+        if not result:
+            return "错误: 查询失败。请修改查询语句后重试。"
+        return result
+    except Exception as e:
+        # 连接可能已失效，重试一次
+        try:
+            if hasattr(db, 'engine'):
+                db.engine.dispose()  # 丢弃失效连接
+            result = db.run_no_throw(query)
+            if not result:
+                return "错误: 查询失败。请修改查询语句后重试。"
+            return result
+        except Exception as retry_e:
+            return f"错误: 查询执行失败 - {str(retry_e)}"

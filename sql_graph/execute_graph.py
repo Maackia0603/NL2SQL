@@ -3,8 +3,8 @@ from langgraph.graph import MessagesState
 
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain_community.utilities import SQLDatabase
-from sql_graph.my_llm import llm
 
+from sql_graph.my_llm import llm
 from sql_graph.text2sql_graph import make_graph
 
 

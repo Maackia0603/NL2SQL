@@ -33,20 +33,23 @@ def should_continue(state: SQLState) -> Literal[END, "check_query"]:
 @asynccontextmanager
 async def make_graph():
     # 生成一个智能体
-    client = MultiServerMCPClient({'lx_mcp': mcp_server_config})
+    client = MultiServerMCPClient({'data_mcp': mcp_server_config})
     # 可以连接多个mcp服务
     # client = MultiServerMCPClient({'lx_mcp': mcp_server_config, 'aliyun': sdf})
     # 拿mcp服务器资源
-    # resourse = await client.get_resources('lx_mcp', uri:mcp服务端资源数据)
+    # resourse = await client.get_resources('data_mcp', uri:mcp服务端资源数据)
 
     # 创建工作流
     """初始化MCPClient和工具，并且编译工作流"""
     # 与mcp客户端通信,因为mcp服务器是异步的，所以代码都是存放在异步中
-    async with client.session('lx_mcp') as session:
+    async with client.session('data_mcp') as session:
+
         # 拿到mcp的工具，工具需要智能体来调用
         tools = await load_mcp_tools(session)
+
         # 所有表名列表的工具 用于获取数据库中有哪些表
         list_tables_tool = next(tool for tool in tools if tool.name == "list_tables_tool")
+        
         # 执行sql的工具
         db_query_tool = next(tool for tool in tools if tool.name == "db_query_tool")
 
@@ -85,17 +88,38 @@ async def make_graph():
             return {'messages': [resp]}
 
         def check_query(state: SQLState):
-            """第六个节点: 检查SQL语句"""
+            """第六个节点: 检查SQL语句。兼容缺少 tool_call.args.query 的情况，避免 KeyError。"""
             system_message = {
                 "role": "system",
                 "content": query_check_system,
             }
-            tool_call = state["messages"][-1].tool_calls[0]
-            # 得到生成后的SQL
-            user_message = {"role": "user", "content": tool_call["args"]["query"]}
+            last_msg = state["messages"][-1]
+            proposed_query = None
+
+            # 优先从工具调用里拿 query
+            try:
+                if getattr(last_msg, "tool_calls", None):
+                    tc = last_msg.tool_calls[0]
+                    args = tc.get("args") if isinstance(tc, dict) else None
+                    if isinstance(args, dict):
+                        proposed_query = args.get("query")
+            except Exception:
+                proposed_query = None
+
+            # 回退：从消息文本中提取（若模型把 SQL 放在 content）
+            if not proposed_query:
+                content = getattr(last_msg, "content", "")
+                if isinstance(content, str) and content.strip():
+                    proposed_query = content.strip()
+
+            # 仍无可用 SQL，则提示并退出本轮
+            if not proposed_query:
+                return {"messages": [AIMessage(content="未生成可检查的 SQL，请继续思考并给出查询语句。")]}
+
+            user_message = {"role": "user", "content": proposed_query}
             llm_with_tools = llm.bind_tools([db_query_tool], tool_choice='any')
             response = llm_with_tools.invoke([system_message, user_message])
-            response.id = state["messages"][-1].id
+            response.id = last_msg.id
 
             return {"messages": [response]}
 
