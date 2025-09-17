@@ -84,3 +84,66 @@ query_check_system = """您是一位注重细节的SQL专家。
 如果发现上述任何错误，请重写查询。如果没有错误，请原样返回查询语句。
 
 检查完成后，您将调用适当的工具来执行查询。"""
+
+# ===== 自定义本地工具 (当前使用，替代MCP工具) =====
+"""
+这些工具提供与MCP工具相同的功能，但直接在本地执行，无需外部服务。
+与mcp_server/mcp_tools.py中的工具功能完全一致。
+
+优势：
+- 无需启动MCP服务器
+- 减少网络通信开销
+- 简化部署和调试
+- 提高响应速度
+"""
+
+from langchain_core.tools import tool
+
+@tool
+def custom_list_tables_tool() -> str:
+    """获取数据库中所有表的列表
+    
+    这个工具与 mcp_server/mcp_tools.py 中的 list_tables_tool 功能完全一致
+    
+    Returns:
+        str: 以逗号分隔的表名列表
+    """
+    try:
+        table_names = db.get_usable_table_names()
+        return ", ".join(table_names)
+    except Exception as e:
+        return f"错误: 获取表列表失败 - {str(e)}"
+
+@tool  
+def custom_db_query_tool(query: str) -> str:
+    """执行SQL查询并返回结果
+    
+    这个工具与 mcp_server/mcp_tools.py 中的 db_query_tool 功能完全一致
+    包含相同的错误处理和重试机制
+    
+    Args:
+        query (str): 要执行的SQL查询语句
+        
+    Returns:
+        str: 查询结果或错误信息
+    """
+    try:
+        result = db.run_no_throw(query)
+        if not result:
+            return "错误: 查询失败。请修改查询语句后重试。"
+        return result
+    except Exception as e:
+        # 连接可能已失效，重试一次 (与MCP版本相同的重试逻辑)
+        try:
+            if hasattr(db, 'engine'):
+                db.engine.dispose()  # 丢弃失效连接
+            result = db.run_no_throw(query)
+            if not result:
+                return "错误: 查询失败。请修改查询语句后重试。"
+            return result
+        except Exception as retry_e:
+            return f"错误: 查询执行失败 - {str(retry_e)}"
+
+# 为了保持与MCP工具的兼容性，设置相同的工具名称
+custom_list_tables_tool.name = "list_tables_tool"
+custom_db_query_tool.name = "db_query_tool"
