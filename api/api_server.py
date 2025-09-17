@@ -37,9 +37,12 @@ app.add_middleware(
 @app.post("/ask")
 async def ask(req: AskRequest) -> Dict[str, Any]:
     outputs: List[str] = []
+    # 增加递归限制，防止无限循环
+    config = {"recursion_limit": 50}
     async for event in app.state.graph.astream(
         {"messages": [{"role": "user", "content": req.question}]},
         stream_mode="values",
+        config=config,
     ):
         msg = event["messages"][-1]
         content = getattr(msg, "content", None)

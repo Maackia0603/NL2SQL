@@ -30,8 +30,13 @@ tools = toolkit.get_tools()
 
 # 获取表结构的工具
 get_schema_tool = next(tool for tool in tools if tool.name == 'sql_db_schema')
+
+# 获取数据库查询工具
+db_query_tool = next(tool for tool in tools if tool.name == 'sql_db_query')
+
 # 测试工具调用
 # print(get_schema_tool.invoke('employees'))
+# print(db_query_tool.invoke('SELECT * FROM employees LIMIT 5'))
 
 # 同步的工具代码
 
