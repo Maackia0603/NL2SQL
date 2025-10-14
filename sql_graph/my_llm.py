@@ -1,6 +1,6 @@
 from langchain_openai import ChatOpenAI
 
-from sql_graph.env_utils import OPENAI_API_KEY, DEEPSEEK_API_KEY, Qwen_API_KEY
+from sql_graph.env_utils import OPENAI_API_KEY, DEEPSEEK_API_KEY, Qwen_API_KEY, Qwen_3_API_KEY
 
 
 
@@ -18,12 +18,19 @@ from sql_graph.env_utils import OPENAI_API_KEY, DEEPSEEK_API_KEY, Qwen_API_KEY
 #     base_url="https://api.deepseek.com")
 
 
+# llm = ChatOpenAI(
+#     temperature=0,
+#     model="qwen3-8b",
+#     openai_api_key="EMPTY",
+#     openai_api_base="http://localhost:6006/v1",
+#     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+# )
+
 llm = ChatOpenAI(
     temperature=0,
-    model="qwen3-8b",
-    openai_api_key="EMPTY",
-    openai_api_base="http://localhost:6006/v1",
-    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    model="qwen3-max-preview",
+    openai_api_key=Qwen_3_API_KEY,
+    openai_api_base="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
 # free-qwen3
