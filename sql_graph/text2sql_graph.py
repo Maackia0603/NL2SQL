@@ -216,9 +216,59 @@ async def make_graph():
 
             return {"messages": [response]}
 
-        # 第七个节点
-        run_query_node = ToolNode([db_query_tool], name="run_query")
-        logger.info("✅ 创建SQL执行节点")
+        # 第七个节点：自定义SQL执行节点，不通过消息流传递结果
+        def run_query(state: SQLState):
+            """执行SQL查询并将结果存储到状态中，不进入消息流"""
+            logger.info("🔍 [节点7] run_query - 开始执行SQL查询")
+            logger.info(f"📊 当前状态消息数量: {len(state['messages'])}")
+            
+            last_msg = state["messages"][-1]
+            proposed_query = None
+            
+            # 从最后一条消息中提取SQL查询
+            try:
+                if getattr(last_msg, "tool_calls", None):
+                    tc = last_msg.tool_calls[0]
+                    logger.info(f"🛠️ 找到工具调用: {tc}")
+                    args = tc.get("args") if isinstance(tc, dict) else None
+                    if isinstance(args, dict):
+                        proposed_query = args.get("query")
+                        logger.info(f"📝 从工具调用提取SQL: {proposed_query}")
+            except Exception as e:
+                logger.warning(f"⚠️ 从工具调用提取SQL失败: {e}")
+                proposed_query = None
+            
+            # 回退：从消息文本中提取
+            if not proposed_query:
+                content = getattr(last_msg, "content", "")
+                if isinstance(content, str) and content.strip():
+                    proposed_query = content.strip()
+                    logger.info(f"📝 从消息内容提取SQL: {proposed_query}")
+            
+            if not proposed_query:
+                logger.error("❌ 未能提取到有效的SQL查询")
+                return {"sql_data": "错误: 未能提取到有效的SQL查询"}
+            
+            # 执行SQL查询
+            try:
+                logger.info(f"🚀 执行SQL查询: {proposed_query}")
+                result = db_query_tool.invoke(proposed_query)
+                
+                if not result or result.startswith("错误"):
+                    logger.warning(f"⚠️ SQL查询失败或无结果: {result}")
+                    sql_data = result if result else "查询无结果"
+                else:
+                    logger.info(f"✅ SQL查询成功，结果长度: {len(str(result))}")
+                    sql_data = result
+                
+                # 将结果存储到状态中，不添加到消息流
+                return {"sql_data": sql_data}
+                
+            except Exception as e:
+                logger.error(f"❌ SQL执行失败: {e}")
+                return {"sql_data": f"SQL执行失败: {str(e)}"}
+        
+        logger.info("✅ 创建自定义SQL执行节点")
 
         # 创建工作流，得到工作流编译器
         logger.info("🏗️ 开始构建工作流...")
@@ -232,7 +282,7 @@ async def make_graph():
         workflow.add_node(get_schema_node)
         workflow.add_node(generate_query)
         workflow.add_node(check_query)
-        workflow.add_node(run_query_node)
+        workflow.add_node(run_query)  # 使用自定义的run_query函数
         logger.info("✅ 所有节点添加完成")
 
         # 添加边

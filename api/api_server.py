@@ -58,6 +58,7 @@ app.add_middleware(
 async def ask(req: AskRequest) -> Dict[str, Any]:
     logger.info(f"📥 收到新的查询请求: {req.question}")
     outputs: List[str] = []
+    sql_data = None  # 存储SQL执行结果
     
     try:
         # 增加递归限制，防止无限循环
@@ -75,6 +76,12 @@ async def ask(req: AskRequest) -> Dict[str, Any]:
             step_count += 1
             logger.info(f"📊 第{step_count}步执行完成")
             
+            # 从状态中获取SQL数据（如果存在）
+            if "sql_data" in event and event["sql_data"]:
+                sql_data = event["sql_data"]
+                logger.info(f"📊 从状态中获取SQL数据，数据长度: {len(str(sql_data))}")
+                continue  # SQL数据不进入消息流，直接跳过
+            
             msg = event["messages"][-1]
             content = getattr(msg, "content", None)
             
@@ -91,14 +98,27 @@ async def ask(req: AskRequest) -> Dict[str, Any]:
         
         logger.info(f"✅ 工作流执行完成，总共{step_count}步，生成{len(outputs)}个输出")
         
-        result = {"outputs": outputs, "final": outputs[-1] if outputs else ""}
-        logger.info(f"📤 返回结果: final='{result['final'][:100]}...' (共{len(outputs)}个输出)")
+        # 构建返回结果
+        result = {
+            "outputs": outputs, 
+            "final": outputs[-1] if outputs else "",
+            "data": sql_data  # 添加SQL执行结果作为data字段
+        }
+        
+        if sql_data:
+            logger.info(f"📤 返回结果包含SQL数据，数据长度: {len(str(sql_data))}")
+        else:
+            logger.info(f"📤 返回结果: final='{result['final'][:100]}...' (共{len(outputs)}个输出)")
         
         return result
         
     except Exception as e:
         logger.error(f"❌ 处理请求时出错: {e}")
-        error_result = {"outputs": [f"处理出错: {str(e)}"], "final": f"处理出错: {str(e)}"}
+        error_result = {
+            "outputs": [f"处理出错: {str(e)}"], 
+            "final": f"处理出错: {str(e)}",
+            "data": None
+        }
         return error_result
 
 
