@@ -289,11 +289,64 @@ def custom_list_tables_tool() -> str:
     except Exception as e:
         return f"错误: 获取表列表失败 - {str(e)}"
 
+def _convert_geometry_to_geojson(query: str, conn) -> str:
+    """将查询中的geometry字段自动转换为GeoJSON格式
+    
+    Args:
+        query (str): 原始SQL查询
+        conn: 数据库连接
+        
+    Returns:
+        str: 修改后的SQL查询
+    """
+    import re
+    from sqlalchemy import text
+    
+    # 提取表名
+    table_name = None
+    if 'FROM' in query.upper():
+        parts = query.upper().split('FROM')
+        if len(parts) > 1:
+            table_part = parts[1].strip().split()[0]
+            table_name = table_part.lower()
+    
+    if not table_name:
+        return query
+    
+    try:
+        # 查询表中的geometry字段
+        geom_query = f"""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = '{table_name}' 
+        AND (data_type = 'USER-DEFINED' AND udt_name LIKE '%geom%')
+        """
+        geom_result = conn.execute(text(geom_query))
+        geom_columns = [row[0] for row in geom_result.fetchall()]
+        
+        if not geom_columns:
+            return query
+        
+        # 修改SELECT语句，将geometry字段转换为GeoJSON
+        modified_query = query
+        for geom_col in geom_columns:
+            # 使用正则表达式替换geometry字段
+            pattern = rf'\b{geom_col}\b'
+            replacement = f'ST_AsGeoJSON({geom_col}) AS {geom_col}_geojson'
+            modified_query = re.sub(pattern, replacement, modified_query, flags=re.IGNORECASE)
+        
+        return modified_query
+        
+    except Exception as e:
+        # 如果转换失败，返回原始查询
+        return query
+
 @tool  
 def custom_db_query_tool(query: str) -> str:
     """执行SQL查询并返回完整结果，避免LangChain截断
     
     使用直接的SQLAlchemy执行，确保返回完整的数据，特别是geometry字段
+    自动将geometry字段转换为GeoJSON格式
     
     Args:
         query (str): 要执行的SQL查询语句
@@ -311,17 +364,111 @@ def custom_db_query_tool(query: str) -> str:
         
         # 使用直接的SQLAlchemy执行，避免LangChain的截断
         with db._engine.connect() as conn:
-            result = conn.execute(text(query))
+            # 首先检查查询中是否包含geometry字段，如果有则自动转换为GeoJSON
+            modified_query = _convert_geometry_to_geojson(query, conn)
+            
+            result = conn.execute(text(modified_query))
             rows = result.fetchall()
             
             if not rows:
                 logger.warning("⚠️ [SQL执行工具] 查询无结果")
                 return "错误: 查询失败。请修改查询语句后重试。"
             
-            # 将结果转换为字符串，保持完整格式
-            result_str = str(rows)
+            # 获取列名和类型信息
+            columns = result.keys()
+            column_types = []
+            
+            # 通过查询information_schema获取列类型信息
+            table_name = None
+            if 'FROM' in query.upper():
+                # 简单提取表名（这里可以改进）
+                parts = query.upper().split('FROM')
+                if len(parts) > 1:
+                    table_part = parts[1].strip().split()[0]
+                    table_name = table_part.lower()
+            
+            if table_name:
+                try:
+                    type_query = f"""
+                    SELECT column_name, data_type, udt_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table_name}' 
+                    ORDER BY ordinal_position
+                    """
+                    type_result = conn.execute(text(type_query))
+                    type_rows = type_result.fetchall()
+                    
+                    # 构建类型映射
+                    type_map = {}
+                    for type_row in type_rows:
+                        col_name = type_row[0]
+                        data_type = type_row[1]
+                        udt_name = type_row[2]
+                        
+                        # 处理PostGIS geometry类型
+                        if data_type == 'USER-DEFINED' and 'geom' in udt_name.lower():
+                            type_map[col_name] = f"GEOMETRY({udt_name})"
+                        else:
+                            type_map[col_name] = data_type
+                    
+                    # 按列顺序获取类型，检查是否被转换为GeoJSON
+                    for column in columns:
+                        original_col = column.replace('_geojson', '')  # 移除_geojson后缀
+                        if column.endswith('_geojson'):
+                            column_types.append('GeoJSON')
+                        else:
+                            column_types.append(type_map.get(original_col, 'UNKNOWN'))
+                            
+                except Exception as e:
+                    logger.warning(f"⚠️ [SQL执行工具] 获取列类型失败: {e}")
+                    # 回退：使用示例数据推断类型
+                    for column in columns:
+                        if rows:
+                            sample_value = rows[0][list(columns).index(column)]
+                            if sample_value is None:
+                                column_types.append('UNKNOWN')
+                            else:
+                                column_types.append(type(sample_value).__name__)
+                        else:
+                            column_types.append('UNKNOWN')
+            else:
+                # 无法确定表名，使用示例数据推断类型
+                for column in columns:
+                    if rows:
+                        sample_value = rows[0][list(columns).index(column)]
+                        if sample_value is None:
+                            column_types.append('UNKNOWN')
+                        else:
+                            column_types.append(type(sample_value).__name__)
+                    else:
+                        column_types.append('UNKNOWN')
+            
+            logger.info(f"📋 [SQL执行工具] 查询列名: {list(columns)}")
+            logger.info(f"📋 [SQL执行工具] 查询列类型: {column_types}")
+            
+            # 将结果转换为带字段名和类型的字典列表格式
+            result_data = []
+            for row in rows:
+                row_dict = {}
+                for i, column in enumerate(columns):
+                    row_dict[column] = row[i]
+                result_data.append(row_dict)
+            
+            # 构建包含元数据的完整响应
+            response_data = {
+                "metadata": {
+                    "columns": list(columns),
+                    "column_types": column_types,
+                    "row_count": len(result_data)
+                },
+                "data": result_data
+            }
+            
+            # 转换为JSON字符串格式，保持完整数据
+            import json
+            result_str = json.dumps(response_data, ensure_ascii=False, default=str)
             logger.info(f"📊 [SQL执行工具] SQL执行结果长度: {len(result_str)}")
-            logger.info(f"✅ [SQL执行工具] SQL查询执行成功，数据完整")
+            logger.info(f"✅ [SQL执行工具] SQL查询执行成功，数据完整，包含字段名和类型")
             return result_str
             
     except Exception as e:
@@ -332,16 +479,107 @@ def custom_db_query_tool(query: str) -> str:
             db._engine.dispose()  # 丢弃失效连接
             
             with db._engine.connect() as conn:
-                result = conn.execute(text(query))
+                # 首先检查查询中是否包含geometry字段，如果有则自动转换为GeoJSON
+                modified_query = _convert_geometry_to_geojson(query, conn)
+                
+                result = conn.execute(text(modified_query))
                 rows = result.fetchall()
                 
                 if not rows:
                     logger.warning("⚠️ [SQL执行工具] 重试后查询仍无结果")
                     return "错误: 查询失败。请修改查询语句后重试。"
                 
-                result_str = str(rows)
+                # 获取列名和类型信息
+                columns = result.keys()
+                column_types = []
+                
+                # 通过查询information_schema获取列类型信息
+                table_name = None
+                if 'FROM' in query.upper():
+                    # 简单提取表名（这里可以改进）
+                    parts = query.upper().split('FROM')
+                    if len(parts) > 1:
+                        table_part = parts[1].strip().split()[0]
+                        table_name = table_part.lower()
+                
+                if table_name:
+                    try:
+                        type_query = f"""
+                        SELECT column_name, data_type, udt_name 
+                        FROM information_schema.columns 
+                        WHERE table_name = '{table_name}' 
+                        ORDER BY ordinal_position
+                        """
+                        type_result = conn.execute(text(type_query))
+                        type_rows = type_result.fetchall()
+                        
+                        # 构建类型映射
+                        type_map = {}
+                        for type_row in type_rows:
+                            col_name = type_row[0]
+                            data_type = type_row[1]
+                            udt_name = type_row[2]
+                            
+                            # 处理PostGIS geometry类型
+                            if data_type == 'USER-DEFINED' and 'geom' in udt_name.lower():
+                                type_map[col_name] = f"GEOMETRY({udt_name})"
+                            else:
+                                type_map[col_name] = data_type
+                        
+                        # 按列顺序获取类型
+                        for column in columns:
+                            column_types.append(type_map.get(column, 'UNKNOWN'))
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ [SQL执行工具] 重试后获取列类型失败: {e}")
+                        # 回退：使用示例数据推断类型
+                        for column in columns:
+                            if rows:
+                                sample_value = rows[0][list(columns).index(column)]
+                                if sample_value is None:
+                                    column_types.append('UNKNOWN')
+                                else:
+                                    column_types.append(type(sample_value).__name__)
+                            else:
+                                column_types.append('UNKNOWN')
+                else:
+                    # 无法确定表名，使用示例数据推断类型
+                    for column in columns:
+                        if rows:
+                            sample_value = rows[0][list(columns).index(column)]
+                            if sample_value is None:
+                                column_types.append('UNKNOWN')
+                            else:
+                                column_types.append(type(sample_value).__name__)
+                        else:
+                            column_types.append('UNKNOWN')
+                
+                logger.info(f"📋 [SQL执行工具] 重试后查询列名: {list(columns)}")
+                logger.info(f"📋 [SQL执行工具] 重试后查询列类型: {column_types}")
+                
+                # 将结果转换为带字段名和类型的字典列表格式
+                result_data = []
+                for row in rows:
+                    row_dict = {}
+                    for i, column in enumerate(columns):
+                        row_dict[column] = row[i]
+                    result_data.append(row_dict)
+                
+                # 构建包含元数据的完整响应
+                response_data = {
+                    "metadata": {
+                        "columns": list(columns),
+                        "column_types": column_types,
+                        "row_count": len(result_data)
+                    },
+                    "data": result_data
+                }
+                
+                # 转换为JSON字符串格式，保持完整数据
+                import json
+                result_str = json.dumps(response_data, ensure_ascii=False, default=str)
                 logger.info(f"📊 [SQL执行工具] 重试后SQL执行结果长度: {len(result_str)}")
-                logger.info(f"✅ [SQL执行工具] 重试后SQL查询执行成功，数据完整")
+                logger.info(f"✅ [SQL执行工具] 重试后SQL查询执行成功，数据完整，包含字段名和类型")
                 return result_str
                 
         except Exception as retry_e:
