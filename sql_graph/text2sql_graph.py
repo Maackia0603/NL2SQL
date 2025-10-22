@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Literal
 import logging
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 # === MCP 相关导入 (保留以备将来使用) ===
 # from langchain_mcp_adapters.client import MultiServerMCPClient
 # from langchain_mcp_adapters.tools import load_mcp_tools
@@ -30,7 +30,8 @@ from sql_graph.tools_node import (
     call_get_schema, 
     get_schema_node,
     custom_list_tables_tool,
-    custom_db_query_tool
+    custom_db_query_tool,
+    custom_get_schema_tool
 )
 
 # 配置日志
@@ -216,57 +217,99 @@ async def make_graph():
 
             return {"messages": [response]}
 
-        # 第七个节点：自定义SQL执行节点，不通过消息流传递结果
+        def execute_sql_and_emit(state: SQLState, query: str):
+            """执行SQL并返回双通道结果：全量数据给前端 + 摘要消息给模型"""
+            logger.info(f"🚀 [SQL执行] 开始执行SQL查询")
+            logger.info(f"📝 [SQL执行] 执行的SQL语句: {query}")
+            
+            # 执行SQL
+            try:
+                logger.info("🔧 [SQL执行] 调用数据库查询工具")
+                result = db_query_tool.invoke(query)
+                logger.info(f"📊 [SQL执行] 数据库查询工具返回结果长度: {len(str(result)) if result else 0}")
+                
+                if not result:
+                    sql_data = "查询无结果"
+                    logger.warning("⚠️ [SQL执行] SQL查询无结果")
+                elif isinstance(result, str) and result.startswith("错误"):
+                    sql_data = result
+                    logger.warning(f"⚠️ [SQL执行] SQL查询失败: {result}")
+                else:
+                    sql_data = result
+                    logger.info(f"✅ [SQL执行] SQL查询成功，结果长度: {len(str(result))}")
+            except Exception as e:
+                sql_data = f"SQL执行失败: {str(e)}"
+                logger.error(f"❌ [SQL执行] SQL执行失败: {e}")
+
+            # 仅给模型提供"摘要"，避免超长上下文导致截断与高 token
+            preview = str(sql_data)
+            max_preview_chars = 1000
+            if len(preview) > max_preview_chars:
+                preview = preview[:max_preview_chars] + "...(数据已截断，完整结果已返回给前端)"
+                logger.info(f"📝 结果预览已截断，原始长度: {len(str(sql_data))}, 预览长度: {max_preview_chars}")
+
+            # 关联上一次 tool_call（若有）
+            last_msg = state["messages"][-1] if state["messages"] else None
+            tool_call_id = None
+            if last_msg and getattr(last_msg, "tool_calls", None):
+                tc = last_msg.tool_calls[0]
+                tool_call_id = tc.get("id") if isinstance(tc, dict) else None
+                logger.info(f"🔗 关联工具调用ID: {tool_call_id}")
+
+            # 返回一条工具结果消息给模型，推动流程收敛
+            tool_msg = ToolMessage(
+                content=f"SQL执行完成。查询结果:\n{preview}",
+                tool_call_id=tool_call_id or "db_query_tool"
+            )
+            
+            logger.info(f"📤 返回工具消息给模型，消息长度: {len(tool_msg.content)}")
+
+            # 同时把完整结果放入状态，API 会通过 data 字段返回给前端
+            return {"messages": [tool_msg], "sql_data": sql_data}
+
+        # 第七个节点：自定义SQL执行节点，返回摘要消息 + 全量数据
         def run_query(state: SQLState):
-            """执行SQL查询并将结果存储到状态中，不进入消息流"""
+            """执行SQL查询并将完整结果存储到状态中，同时返回摘要消息给模型"""
             logger.info("🔍 [节点7] run_query - 开始执行SQL查询")
             logger.info(f"📊 当前状态消息数量: {len(state['messages'])}")
             
             last_msg = state["messages"][-1]
+            logger.info(f"📝 [节点7] 最后一条消息类型: {type(last_msg).__name__}")
             proposed_query = None
             
             # 从最后一条消息中提取SQL查询
+            logger.info("🔍 [节点7] 开始从最后一条消息中提取SQL查询")
             try:
                 if getattr(last_msg, "tool_calls", None):
                     tc = last_msg.tool_calls[0]
-                    logger.info(f"🛠️ 找到工具调用: {tc}")
+                    logger.info(f"🛠️ [节点7] 找到工具调用: {tc}")
                     args = tc.get("args") if isinstance(tc, dict) else None
                     if isinstance(args, dict):
                         proposed_query = args.get("query")
-                        logger.info(f"📝 从工具调用提取SQL: {proposed_query}")
+                        logger.info(f"📝 [节点7] 从工具调用提取SQL: {proposed_query}")
             except Exception as e:
-                logger.warning(f"⚠️ 从工具调用提取SQL失败: {e}")
+                logger.warning(f"⚠️ [节点7] 从工具调用提取SQL失败: {e}")
                 proposed_query = None
             
             # 回退：从消息文本中提取
             if not proposed_query:
+                logger.info("🔄 [节点7] 从工具调用未提取到SQL，尝试从消息内容提取")
                 content = getattr(last_msg, "content", "")
                 if isinstance(content, str) and content.strip():
                     proposed_query = content.strip()
-                    logger.info(f"📝 从消息内容提取SQL: {proposed_query}")
+                    logger.info(f"📝 [节点7] 从消息内容提取SQL: {proposed_query}")
             
             if not proposed_query:
-                logger.error("❌ 未能提取到有效的SQL查询")
-                return {"sql_data": "错误: 未能提取到有效的SQL查询"}
+                logger.error("❌ [节点7] 未能提取到有效的SQL查询")
+                error_msg = ToolMessage(
+                    content="错误: 未能提取到有效的SQL查询",
+                    tool_call_id="db_query_tool"
+                )
+                return {"messages": [error_msg], "sql_data": "错误: 未能提取到有效的SQL查询"}
             
-            # 执行SQL查询
-            try:
-                logger.info(f"🚀 执行SQL查询: {proposed_query}")
-                result = db_query_tool.invoke(proposed_query)
-                
-                if not result or result.startswith("错误"):
-                    logger.warning(f"⚠️ SQL查询失败或无结果: {result}")
-                    sql_data = result if result else "查询无结果"
-                else:
-                    logger.info(f"✅ SQL查询成功，结果长度: {len(str(result))}")
-                    sql_data = result
-                
-                # 将结果存储到状态中，不添加到消息流
-                return {"sql_data": sql_data}
-                
-            except Exception as e:
-                logger.error(f"❌ SQL执行失败: {e}")
-                return {"sql_data": f"SQL执行失败: {str(e)}"}
+            logger.info(f"✅ [节点7] 成功提取SQL查询，准备执行: {proposed_query}")
+            # 专用函数：执行SQL + 返回摘要消息 + 存全量数据
+            return execute_sql_and_emit(state, proposed_query)
         
         logger.info("✅ 创建自定义SQL执行节点")
 
