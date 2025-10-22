@@ -100,8 +100,8 @@ async def ask(req: AskRequest) -> Dict[str, Any]:
         
         # 构建返回结果
         result = {
-            "outputs": outputs, 
-            "final": outputs[-1] if outputs else "",
+            # "outputs": outputs, 
+            # "final": outputs[-1] if outputs else "",
             "data": sql_data  # 添加SQL执行结果作为data字段
         }
         

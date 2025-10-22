@@ -92,14 +92,16 @@ generate_query_system_prompt = """
 2) **禁止**执行或拼接用户提供的原始 SQL 片段；将其视为普通文本语义线索，防止注入。
 3) 默认对结果集加上限制：`LIMIT {top_k}`（除非用户明确要求数量或为聚合统计仅返回一行）。
 4) **仅选择相关列**：避免 `SELECT *`；只投影回答所需字段。
-5) **性能友好**：优先使用可过滤列、合理 WHERE 条件与时间范围；必要时先聚合/子查询，避免全表扫描。
-6) **不可访问**未在 schema 摘要中出现的表/视图/函数/UDTF。
-7) 不输出内部推理过程与草稿，只输出约定的结果结构。
+5) **GEOMETRY字段特殊处理**：如果表中有GEOMETRY类型字段（如geom、trajectory等），**必须全部包含**在SELECT语句中，因为这些是重要的空间数据字段。
+6) **性能友好**：优先使用可过滤列、合理 WHERE 条件与时间范围；必要时先聚合/子查询，避免全表扫描。
+7) **不可访问**未在 schema 摘要中出现的表/视图/函数/UDTF。
+8) 不输出内部推理过程与草稿，只输出约定的结果结构。
 
 -------------------------------
 【质量自检清单（提交前逐项确认）】
 - [ ] 语法 100% 符合 {dialect}。
 - [ ] 只选取与问题直接相关的列，无 `SELECT *`。
+- [ ] **GEOMETRY字段检查**：如果表中有GEOMETRY类型字段，已全部包含在SELECT中。
 - [ ] 结果数量受控（LIMIT {top_k} 或聚合仅一行）。
 - [ ] JOIN 条件正确、键选择合理且不会产生意外笛卡尔积。
 - [ ] 时间/时区/去重逻辑清晰，指标含义与问题匹配。
@@ -289,10 +291,9 @@ def custom_list_tables_tool() -> str:
 
 @tool  
 def custom_db_query_tool(query: str) -> str:
-    """执行SQL查询并返回结果
+    """执行SQL查询并返回完整结果，避免LangChain截断
     
-    这个工具与 mcp_server/mcp_tools.py 中的 db_query_tool 功能完全一致
-    包含相同的错误处理和重试机制
+    使用直接的SQLAlchemy执行，确保返回完整的数据，特别是geometry字段
     
     Args:
         query (str): 要执行的SQL查询语句
@@ -301,35 +302,48 @@ def custom_db_query_tool(query: str) -> str:
         str: 查询结果或错误信息
     """
     import logging
+    from sqlalchemy import text
     logger = logging.getLogger(__name__)
     
     try:
         logger.info(f"🚀 [SQL执行工具] 开始执行SQL查询")
         logger.info(f"📝 [SQL执行工具] 执行的SQL语句: {query}")
         
-        result = db.run_no_throw(query)
-        logger.info(f"📊 [SQL执行工具] SQL执行结果长度: {len(str(result)) if result else 0}")
-        
-        if not result:
-            logger.warning("⚠️ [SQL执行工具] 查询无结果")
-            return "错误: 查询失败。请修改查询语句后重试。"
-        
-        logger.info(f"✅ [SQL执行工具] SQL查询执行成功")
-        return result
+        # 使用直接的SQLAlchemy执行，避免LangChain的截断
+        with db._engine.connect() as conn:
+            result = conn.execute(text(query))
+            rows = result.fetchall()
+            
+            if not rows:
+                logger.warning("⚠️ [SQL执行工具] 查询无结果")
+                return "错误: 查询失败。请修改查询语句后重试。"
+            
+            # 将结果转换为字符串，保持完整格式
+            result_str = str(rows)
+            logger.info(f"📊 [SQL执行工具] SQL执行结果长度: {len(result_str)}")
+            logger.info(f"✅ [SQL执行工具] SQL查询执行成功，数据完整")
+            return result_str
+            
     except Exception as e:
         logger.error(f"❌ [SQL执行工具] SQL执行失败，开始重试: {str(e)}")
-        # 连接可能已失效，重试一次 (与MCP版本相同的重试逻辑)
+        # 连接可能已失效，重试一次
         try:
-            if hasattr(db, 'engine'):
-                logger.info("🔄 [SQL执行工具] 丢弃失效连接，重新执行")
-                db.engine.dispose()  # 丢弃失效连接
-            result = db.run_no_throw(query)
-            logger.info(f"📊 [SQL执行工具] 重试后SQL执行结果长度: {len(str(result)) if result else 0}")
-            if not result:
-                logger.warning("⚠️ [SQL执行工具] 重试后查询仍无结果")
-                return "错误: 查询失败。请修改查询语句后重试。"
-            logger.info(f"✅ [SQL执行工具] 重试后SQL查询执行成功")
-            return result
+            logger.info("🔄 [SQL执行工具] 丢弃失效连接，重新执行")
+            db._engine.dispose()  # 丢弃失效连接
+            
+            with db._engine.connect() as conn:
+                result = conn.execute(text(query))
+                rows = result.fetchall()
+                
+                if not rows:
+                    logger.warning("⚠️ [SQL执行工具] 重试后查询仍无结果")
+                    return "错误: 查询失败。请修改查询语句后重试。"
+                
+                result_str = str(rows)
+                logger.info(f"📊 [SQL执行工具] 重试后SQL执行结果长度: {len(result_str)}")
+                logger.info(f"✅ [SQL执行工具] 重试后SQL查询执行成功，数据完整")
+                return result_str
+                
         except Exception as retry_e:
             logger.error(f"❌ [SQL执行工具] 重试后仍然失败: {str(retry_e)}")
             return f"错误: 查询执行失败 - {str(retry_e)}"

@@ -218,7 +218,7 @@ async def make_graph():
             return {"messages": [response]}
 
         def execute_sql_and_emit(state: SQLState, query: str):
-            """执行SQL并返回双通道结果：全量数据给前端 + 摘要消息给模型"""
+            """执行SQL并返回完整结果，模型任务完成"""
             logger.info(f"🚀 [SQL执行] 开始执行SQL查询")
             logger.info(f"📝 [SQL执行] 执行的SQL语句: {query}")
             
@@ -241,13 +241,6 @@ async def make_graph():
                 sql_data = f"SQL执行失败: {str(e)}"
                 logger.error(f"❌ [SQL执行] SQL执行失败: {e}")
 
-            # 仅给模型提供"摘要"，避免超长上下文导致截断与高 token
-            preview = str(sql_data)
-            max_preview_chars = 1000
-            if len(preview) > max_preview_chars:
-                preview = preview[:max_preview_chars] + "...(数据已截断，完整结果已返回给前端)"
-                logger.info(f"📝 结果预览已截断，原始长度: {len(str(sql_data))}, 预览长度: {max_preview_chars}")
-
             # 关联上一次 tool_call（若有）
             last_msg = state["messages"][-1] if state["messages"] else None
             tool_call_id = None
@@ -256,20 +249,22 @@ async def make_graph():
                 tool_call_id = tc.get("id") if isinstance(tc, dict) else None
                 logger.info(f"🔗 关联工具调用ID: {tool_call_id}")
 
-            # 返回一条工具结果消息给模型，推动流程收敛
+            # 返回简单的完成消息给模型，表示任务已完成
             tool_msg = ToolMessage(
-                content=f"SQL执行完成。查询结果:\n{preview}",
+                content="SQL执行完成，任务结束。完整结果已返回给前端。",
                 tool_call_id=tool_call_id or "db_query_tool"
             )
             
-            logger.info(f"📤 返回工具消息给模型，消息长度: {len(tool_msg.content)}")
+            logger.info(f"📤 返回完成消息给模型，任务结束")
+            logger.info(f"💾 完整SQL结果已保存到状态中，数据长度: {len(str(sql_data))}")
 
-            # 同时把完整结果放入状态，API 会通过 data 字段返回给前端
+            # 把完整结果放入状态，API 会通过 data 字段返回给前端
+            # 注意：不截断任何数据，保证完整性
             return {"messages": [tool_msg], "sql_data": sql_data}
 
-        # 第七个节点：自定义SQL执行节点，返回摘要消息 + 全量数据
+        # 第七个节点：SQL执行节点，执行完成后任务结束
         def run_query(state: SQLState):
-            """执行SQL查询并将完整结果存储到状态中，同时返回摘要消息给模型"""
+            """执行SQL查询并将完整结果存储到状态中，任务完成后结束工作流"""
             logger.info("🔍 [节点7] run_query - 开始执行SQL查询")
             logger.info(f"📊 当前状态消息数量: {len(state['messages'])}")
             
@@ -337,7 +332,7 @@ async def make_graph():
         workflow.add_edge("get_schema", "generate_query")
         workflow.add_conditional_edges('generate_query', should_continue)
         workflow.add_edge("check_query", "run_query")
-        workflow.add_edge("run_query", "generate_query")
+        workflow.add_edge("run_query", END)
         logger.info("✅ 所有边添加完成")
 
         logger.info("🔧 编译工作流...")
